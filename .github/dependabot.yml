@@ -1,0 +1,20 @@
+# Mises à jour de l'amont : une PR par nouvelle version (digest) de eclipse-temurin / node, et des actions GitHub.
+# Merger la PR (CI verte = build + Trivy OK) publie une nouvelle image de base, propagée aux produits (build.yml).
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories: ["/jre25", "/jdk25", "/node22"]
+    schedule: { interval: weekly, day: monday, time: "03:00", timezone: UTC }
+    groups:
+      upstream: { patterns: ["*"] }
+    # JRE / JDK 25 et Node 22 voulus : seules les mises à jour dans la même majeure (correctifs, nouveaux digests)
+    ignore:
+      - dependency-name: "eclipse-temurin"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+    commit-message: { prefix: "deps(amont)" }
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: monthly }
+    commit-message: { prefix: "ci" }

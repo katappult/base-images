@@ -1,0 +1,3 @@
+# Vulnérabilités acceptées par le gate Trivy des images de base (build.yml).
+# Une ligne par CVE, TOUJOURS avec justification et date de revue :
+#   CVE-2025-12345  # composant X non utilisé par les produits (raison) — revue avant 2027-01-31

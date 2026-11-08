@@ -1,0 +1,220 @@
+# Images de base : build, scan Trivy, publication GHCR, propagation aux repos qui les utilisent.
+#
+#   ghcr.io/katappult/base-jre25        JRE 25 Temurin, Ubuntu 24.04   -> backends Java (Jib)
+#   ghcr.io/katappult/base-jdk25        JDK 25 Temurin, Ubuntu 24.04   -> outillage de build (contient la JRE 25)
+#   ghcr.io/katappult/base-node22       Node 22 Alpine, runtime         -> étape runner des frontends Next.js
+#   ghcr.io/katappult/base-node22-build Node 22 Alpine, avec npm        -> étapes deps / builder des frontends
+#
+# Tags : <version>-<AAAAMMJJHHMM> IMMUABLE (ex. 25.0.1_8-202611090400) + <majeure> MOBILE (25, 22). Les produits
+# épinglent TOUJOURS tag immuable + digest (…:25.0.1_8-202611090400@sha256:…), jamais le tag mobile.
+#
+# Déclenchement :
+#   - chaque lundi 04:00 UTC : rebuild = derniers correctifs OS (apt/apk upgrade) même sans nouvelle version amont ;
+#   - push sur main (Dockerfile modifié, ex. PR Dependabot mergée = nouvelle version eclipse-temurin / node) ;
+#   - PR : build + scan seulement (rien n'est publié) ;
+#   - manuel : Actions -> « Images de base » -> Run workflow (force = publier même si rien n'a changé).
+# Publication seulement si le contenu a changé : empreinte = Dockerfile + version + liste des paquets installés,
+# comparée à celle de l'image actuellement sous le tag mobile (label org.katappult.base.fingerprint).
+#
+# Sécurité : Trivy BLOQUANT sur CRITICAL corrigeable (exceptions : .trivyignore), HIGH rapporté.
+#
+# Propagation : pour chaque image publiée, PR « chore: images de base » vers develop dans chaque repo qui la
+# référence (remplacement tag + digest). Le merge déclenche la détection de changements de leur CI de déploiement :
+# seuls les composants concernés sont reconstruits.
+# Configuration (rien de spécifique dans ce repo public) :
+#   - variable PRODUCT_REPOS : repos à mettre à jour, séparés par des espaces (owner/repo) ;
+#   - secret BASE_IMAGES_TOKEN : PAT fine-grained limité à ces repos, Contents + Pull requests : read/write.
+# Absents : publication sans propagation (avertissement). Les noms des repos ne sont pas écrits dans les logs (publics).
+name: Images de base
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  push:
+    branches: [main]
+    paths: ['jre25/**', 'jdk25/**', 'node22/**', '.trivyignore', 'trivy-secret.yaml', '.github/workflows/build.yml']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publier même si le contenu n'a pas changé"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: base-images-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: false
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.58.1
+  PUBLISH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: base-jre25,        context: jre25,  target: "",      major: "25", version_var: JAVA_VERSION }
+          - { name: base-jdk25,        context: jdk25,  target: "",      major: "25", version_var: JAVA_VERSION }
+          - { name: base-node22,       context: node22, target: runtime, major: "22", version_var: NODE_VERSION }
+          - { name: base-node22-build, context: node22, target: build,   major: "22", version_var: NODE_VERSION }
+    env:
+      IMAGE: ghcr.io/katappult/${{ matrix.name }}
+      LOCAL: local/${{ matrix.name }}:ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with: { platforms: arm64 }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build local (amd64)
+        run: |
+          docker buildx build --load --platform linux/amd64 ${{ matrix.target && format('--target {0}', matrix.target) || '' }} \
+            --pull -t "$LOCAL" "${{ matrix.context }}"
+
+      - name: Version et empreinte
+        id: meta
+        run: |
+          set -euo pipefail
+          raw=$(docker run --rm --entrypoint sh "$LOCAL" -c 'echo ${${{ matrix.version_var }}}')
+          ver=$(echo "$raw" | sed -e 's/^jdk-//' -e 's/^v//' -e 's/+/_/g')
+          [ -n "$ver" ] || { echo "::error::Version introuvable (\$${{ matrix.version_var }})"; exit 1; }
+          case "$ver" in ${{ matrix.major }}*) ;; *) echo "::error::Version $ver hors de la majeure ${{ matrix.major }}"; exit 1 ;; esac
+          pkgs=$(docker run --rm --entrypoint sh "$LOCAL" -c \
+            '(dpkg-query -W -f "\${Package}=\${Version}\n" 2>/dev/null || apk info -v 2>/dev/null) | sort')
+          fp=$( { cat "${{ matrix.context }}/Dockerfile"; echo "target=${{ matrix.target }} version=$ver"; echo "$pkgs"; } | sha256sum | cut -c1-32)
+          cur=""
+          if docker pull -q --platform linux/amd64 "$IMAGE:${{ matrix.major }}" >/dev/null 2>&1; then
+            cur=$(docker inspect -f '{{ index .Config.Labels "org.katappult.base.fingerprint" }}' "$IMAGE:${{ matrix.major }}")
+          fi
+          tag="$ver-$(date -u +%Y%m%d%H%M)"
+          changed=true; [ "$fp" = "$cur" ] && changed=false
+          echo "version=$ver" >> "$GITHUB_OUTPUT"; echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"; echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "$pkgs" > packages.txt
+          echo "${{ matrix.name }} : version $ver, empreinte $fp (actuelle : ${cur:-aucune}), changé : $changed"
+
+      # UID aléatoire + groupe 0, comme OpenShift (SCC restricted-v2)
+      - name: Test UID OpenShift
+        run: |
+          docker run --rm --user 1000770000:0 --entrypoint sh "$LOCAL" -c \
+            'id; (command -v java >/dev/null && java -version) || node -e "console.log(process.version)"'
+
+      - id: trivy-day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Cache base Trivy
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.trivy-day.outputs.day }}
+          restore-keys: trivy-db-
+      - name: Trivy (rapport HIGH + gate CRITICAL)
+        run: |
+          docker save -o "${{ runner.temp }}/img.tar" "$LOCAL"
+          mkdir -p "$HOME/.cache/trivy"
+          run_trivy() { docker run --rm -v "${{ runner.temp }}:/img" -v "$PWD:/src" -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+                          -w /src "$TRIVY_IMAGE" image --input /img/img.tar --ignore-unfixed --secret-config trivy-secret.yaml "$@"; }
+          run_trivy --severity HIGH,CRITICAL --format table --exit-code 0 | tee trivy.txt
+          { echo "## Trivy — $IMAGE (${{ steps.meta.outputs.version }}, amd64)"; echo '```'; head -c 60000 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          run_trivy --severity CRITICAL --skip-db-update --ignorefile .trivyignore --exit-code 1 --quiet \
+            || { echo "::error::$IMAGE : CVE CRITICAL corrigeable. Attendre le correctif amont (Dependabot / rebuild du lundi) ou justifier dans .trivyignore"; exit 1; }
+
+      - name: Publier (amd64 + arm64)
+        id: push
+        if: env.PUBLISH == 'true' && (steps.meta.outputs.changed == 'true' || inputs.force)
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64,linux/arm64 ${{ matrix.target && format('--target {0}', matrix.target) || '' }} \
+            --pull --push \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.version=${{ steps.meta.outputs.version }}" \
+            --label "org.katappult.base.fingerprint=${{ steps.meta.outputs.fingerprint }}" \
+            --metadata-file meta.json \
+            -t "$IMAGE:${{ steps.meta.outputs.tag }}" -t "$IMAGE:${{ matrix.major }}" "${{ matrix.context }}"
+          digest=$(jq -r '."containerimage.digest"' meta.json)
+          ref="$IMAGE:${{ steps.meta.outputs.tag }}@$digest"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.name }} $ref" > "published-${{ matrix.name }}.txt"
+          { echo "## Publiée : \`$ref\`"; echo "Tag mobile \`$IMAGE:${{ matrix.major }}\` mis à jour."; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Rien à publier
+        if: env.PUBLISH == 'true' && steps.meta.outputs.changed != 'true' && !inputs.force
+        run: |
+          echo "::notice::${{ matrix.name }} : contenu identique à $IMAGE:${{ matrix.major }}, pas de nouvelle image."
+      - uses: actions/upload-artifact@v4
+        if: steps.push.outputs.ref != ''
+        with:
+          name: published-${{ matrix.name }}
+          path: published-${{ matrix.name }}.txt
+          retention-days: 7
+
+  propagate:
+    name: Propagation aux produits
+    needs: build
+    if: always() && !cancelled() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.BASE_IMAGES_TOKEN }}
+      REPOS: ${{ vars.PRODUCT_REPOS }}
+      BRANCH: chore/base-images
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: published-*
+          merge-multiple: true
+          path: published
+      - name: PR vers develop dans chaque produit
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(published/*.txt)
+          [ ${#files[@]} -gt 0 ] || { echo "Aucune image publiée : rien à propager."; exit 0; }
+          [ -n "$GH_TOKEN" ] && [ -n "$REPOS" ] || { echo "::warning::Secret BASE_IMAGES_TOKEN ou variable PRODUCT_REPOS absent : images publiées mais pas propagées."; exit 0; }
+          for repo in $REPOS; do echo "::add-mask::$repo"; echo "::add-mask::${repo#*/}"; done
+          cat published/*.txt
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          i=0
+          for repo in $REPOS; do
+            i=$((i + 1)); echo "=== repo n°$i"
+            rm -rf "w-$i"
+            git clone -q --branch develop "https://x-access-token:${GH_TOKEN}@github.com/$repo.git" "w-$i"
+            cd "w-$i"
+            git checkout -q -B "$BRANCH"
+            changes=""
+            for f in ../published/*.txt; do
+              read -r name ref < "$f"
+              # ref épinglée existante : ghcr.io/katappult/<name>:<tag>@sha256:<64 hex>  (le « : » distingue base-node22 de base-node22-build)
+              pattern="ghcr\.io/katappult/${name}:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}"
+              before=$(git diff | sha1sum)
+              for target in $(git grep -lE "$pattern" -- . || true); do
+                PAT="$pattern" REF="$ref" perl -pi -e 's/$ENV{PAT}/$ENV{REF}/g' "$target"
+              done
+              [ "$(git diff | sha1sum)" = "$before" ] || changes="$changes $name"
+            done
+            if git diff --quiet; then echo "repo n°$i : déjà à jour ou non concerné."; cd ..; continue; fi
+            git commit -qam "chore: images de base à jour (${changes# })" -m "$(cat ../published/*.txt)" \
+              -m "Run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            git push -q -f origin "$BRANCH"
+            if [ -z "$(gh pr list -R "$repo" --head "$BRANCH" --state open --json number -q '.[0].number')" ]; then
+              gh pr create -R "$repo" --base develop --head "$BRANCH" \
+                --title "chore: images de base à jour" \
+                --body "$(printf 'Nouvelles images de base (repo katappult/base-images) :\n\n```\n%s\n```\n\nAprès le merge : **Deploy dev** ne reconstruit que les composants qui utilisent ces images.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$(cat ../published/*.txt)")"
+            else
+              echo "repo n°$i : PR existante mise à jour."
+            fi
+            cd ..
+          done
