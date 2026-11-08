@@ -13,7 +13,7 @@
 #   - push sur main (Dockerfile modifié, ex. PR Dependabot mergée = nouvelle version eclipse-temurin / node) ;
 #   - PR : build + scan seulement (rien n'est publié) ;
 #   - manuel : Actions -> « Images de base » -> Run workflow (force = publier même si rien n'a changé).
-# Publication seulement si le contenu a changé : empreinte = Dockerfile + version + liste des paquets installés,
+# Publication seulement si le contenu a changé : empreinte = Dockerfile (hors commentaires) + version + paquets installés,
 # comparée à celle de l'image actuellement sous le tag mobile (label org.katappult.base.fingerprint).
 #
 # Sécurité : Trivy BLOQUANT sur CRITICAL corrigeable (exceptions : .trivyignore), HIGH rapporté.
@@ -96,7 +96,7 @@ jobs:
           case "$ver" in ${{ matrix.major }}*) ;; *) echo "::error::Version $ver hors de la majeure ${{ matrix.major }}"; exit 1 ;; esac
           pkgs=$(docker run --rm --entrypoint sh "$LOCAL" -c \
             '(dpkg-query -W -f "\${Package}=\${Version}\n" 2>/dev/null || apk info -v 2>/dev/null) | sort')
-          fp=$( { cat "${{ matrix.context }}/Dockerfile"; echo "target=${{ matrix.target }} version=$ver"; echo "$pkgs"; } | sha256sum | cut -c1-32)
+          fp=$( { grep -vE '^[[:space:]]*(#|$)' "${{ matrix.context }}/Dockerfile"; echo "target=${{ matrix.target }} version=$ver"; echo "$pkgs"; } | sha256sum | cut -c1-32)
           cur=""
           if docker pull -q --platform linux/amd64 "$IMAGE:${{ matrix.major }}" >/dev/null 2>&1; then
             cur=$(docker inspect -f '{{ index .Config.Labels "org.katappult.base.fingerprint" }}' "$IMAGE:${{ matrix.major }}")
