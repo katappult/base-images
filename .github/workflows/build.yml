@@ -44,6 +44,7 @@ on:
 permissions:
   contents: read
   packages: write
+  security-events: write   # rapports Trivy dans Security -> Code scanning
 
 concurrency:
   group: base-images-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
@@ -121,16 +122,38 @@ jobs:
           path: ~/.cache/trivy
           key: trivy-db-${{ steps.trivy-day.outputs.day }}
           restore-keys: trivy-db-
-      - name: Trivy (rapport HIGH + gate CRITICAL)
+      - name: Trivy (rapports + contrôle CRITICAL)
         run: |
           docker save -o "${{ runner.temp }}/img.tar" "$LOCAL"
           mkdir -p "$HOME/.cache/trivy"
           run_trivy() { docker run --rm -v "${{ runner.temp }}:/img" -v "$PWD:/src" -v "$HOME/.cache/trivy:/root/.cache/trivy" \
                           -w /src "$TRIVY_IMAGE" image --input /img/img.tar --ignore-unfixed --secret-config trivy-secret.yaml "$@"; }
           run_trivy --severity HIGH,CRITICAL --format table --exit-code 0 | tee trivy.txt
+          run_trivy --severity LOW,MEDIUM,HIGH,CRITICAL --format sarif --output trivy.sarif --exit-code 0 --quiet
           { echo "## Trivy — $IMAGE (${{ steps.meta.outputs.version }}, amd64)"; echo '```'; head -c 60000 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           run_trivy --severity CRITICAL --skip-db-update --ignorefile .trivyignore --exit-code 1 --quiet \
-            || { echo "::error::$IMAGE : CVE CRITICAL corrigeable. Attendre le correctif amont (Dependabot / rebuild du lundi) ou justifier dans .trivyignore"; exit 1; }
+            || { echo "::error::$IMAGE : CVE CRITICAL corrigeable. Attendre le correctif amont (Dependabot / rebuild du lundi) ou justifier dans .trivyignore"; touch gate-failed; }
+
+      # Rapports consultables après coup : Security -> Code scanning (une catégorie par image) et artefact du run
+      - name: Rapport dans Security -> Code scanning
+        if: always() && hashFiles('trivy.sarif') != '' && github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: ${{ matrix.name }}
+      - name: Rapports en artefact
+        if: always() && hashFiles('trivy.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-${{ matrix.name }}
+          path: |
+            trivy.txt
+            trivy.sarif
+            packages.txt
+          retention-days: 90
+
+      - name: Gate CRITICAL
+        run: '[ ! -f gate-failed ] || exit 1'
 
       - name: Publier (amd64 + arm64)
         id: push

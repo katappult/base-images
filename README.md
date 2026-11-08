@@ -51,6 +51,14 @@ build.yml (lundi 04:00, push sur main, manuel)
 Le rebuild du lundi récupère les correctifs OS même sans nouvelle version amont. Si le contenu est identique, rien
 n'est publié et aucune PR n'est ouverte.
 
+## Rapports de sécurité
+
+- **Security → Code scanning** : vulnérabilités Trivy de chaque image (filtre `Tool: Trivy`, une catégorie par image),
+  mises à jour à chaque build (au moins chaque lundi).
+- Chaque run (Actions → **Images de base**) : résumé HIGH / CRITICAL par image, et artefact `rapport-<image>` (rapport
+  texte, SARIF, liste des paquets installés), conservé 90 jours.
+- Images publiées : onglet **Packages** du repo (ou `ghcr.io/katappult/base-*`).
+
 ## Alerte de sécurité
 
 - **Build rouge** : une CVE CRITICAL corrigeable n'a pas encore de correctif amont. La dernière image publiée reste
