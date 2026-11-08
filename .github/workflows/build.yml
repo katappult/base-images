@@ -170,7 +170,7 @@ jobs:
       REPOS: global-travel-planner katappult-cloud imb-backmarket vivasite
       BRANCH: chore/base-images
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: published-*
           merge-multiple: true
