@@ -106,6 +106,12 @@ jobs:
           echo "$pkgs" > packages.txt
           echo "${{ matrix.name }} : version $ver, empreinte $fp (actuelle : ${cur:-aucune}), changé : $changed"
 
+      # UID aléatoire + groupe 0, comme OpenShift (SCC restricted-v2)
+      - name: Test UID OpenShift
+        run: |
+          docker run --rm --user 1000770000:0 --entrypoint sh "$LOCAL" -c \
+            'id; (command -v java >/dev/null && java -version) || node -e "console.log(process.version)"'
+
       - id: trivy-day
         run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
       - name: Cache base Trivy
